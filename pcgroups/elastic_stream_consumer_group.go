@@ -48,6 +48,7 @@ type ElasticConsumerGroupConsumerInstance struct {
 	contextCancel          context.CancelFunc
 	keyWatcher             jetstream.KeyWatcher
 	doneChan               chan error
+	checkpointInterval     time.Duration
 }
 
 // ElasticConsumerGroupConfig is the configuration of an elastic consumer group
@@ -78,8 +79,16 @@ func GetElasticConsumerGroupConfig(ctx context.Context, js jetstream.JetStream, 
 	return getElasticConsumerGroupConfig(ctx, kv, streamName, consumerGroupName)
 }
 
+type ConsumeOpt func(*ElasticConsumerGroupConsumerInstance)
+
+func WithCheckpointInterval(interval time.Duration) ConsumeOpt {
+	return func(config *ElasticConsumerGroupConsumerInstance) {
+		config.checkpointInterval = interval
+	}
+}
+
 // ElasticConsume is the function that will start a go routine to consume messages from the stream (when active)
-func ElasticConsume(ctx context.Context, js jetstream.JetStream, streamName string, consumerGroupName string, memberName string, messageHandler func(msg jetstream.Msg), config jetstream.ConsumerConfig) (ConsumerGroupConsumeContext, error) {
+func ElasticConsume(ctx context.Context, js jetstream.JetStream, streamName string, consumerGroupName string, memberName string, messageHandler func(msg jetstream.Msg), config jetstream.ConsumerConfig, opts ...ConsumeOpt) (ConsumerGroupConsumeContext, error) {
 	var err error
 
 	if messageHandler == nil {
@@ -104,6 +113,10 @@ func ElasticConsume(ctx context.Context, js jetstream.JetStream, streamName stri
 		MemberName:         memberName,
 		consumerUserConfig: config,
 		MessageHandlerCB:   messageHandler,
+	}
+
+	for _, opt := range opts {
+		opt(&instance)
 	}
 
 	instance.js = js
@@ -157,6 +170,15 @@ func (instance *ElasticConsumerGroupConsumerInstance) Done() <-chan error {
 
 // The control routine that will watch for changes in the consumer group config
 func (instance *ElasticConsumerGroupConsumerInstance) instanceRoutine(ctx context.Context) {
+	// Set up checkpoint ticker - if checkpointInterval is not set, the channel will be nil
+	var checkpointTicker *time.Ticker
+	var checkpointChan <-chan time.Time
+	if instance.checkpointInterval > 0 {
+		checkpointTicker = time.NewTicker(instance.checkpointInterval)
+		defer checkpointTicker.Stop()
+		checkpointChan = checkpointTicker.C
+	}
+
 	for {
 		select {
 		case updateMsg, ok := <-instance.keyWatcher.Updates():
@@ -177,38 +199,11 @@ func (instance *ElasticConsumerGroupConsumerInstance) instanceRoutine(ctx contex
 				return
 			}
 
-			var newConfig ElasticConsumerGroupConfig
-			err := json.Unmarshal(updateMsg.Value(), &newConfig)
-			if err != nil {
-				instance.stopConsuming()
-				instance.doneChan <- fmt.Errorf("elastic consumer group %s config watcher received a bad JSON message: %w", composeKey(instance.StreamName, instance.ConsumerGroupName), err)
+			shouldExit, err := instance.processConfigUpdate(ctx, updateMsg)
+			if shouldExit {
+				instance.doneChan <- err
 				return
 			}
-
-			err = validateConfig(newConfig)
-			if err != nil {
-				instance.stopConsuming()
-				instance.doneChan <- fmt.Errorf("elastic consumer group %s config watcher received an invalid config: %w", composeKey(instance.StreamName, instance.ConsumerGroupName), err)
-				return
-			}
-
-			if newConfig.MaxMembers != instance.Config.MaxMembers ||
-				newConfig.Filter != instance.Config.Filter || newConfig.MaxBufferedMsgs != instance.Config.MaxBufferedMsgs || newConfig.MaxBufferedBytes != instance.Config.MaxBufferedBytes ||
-				!reflect.DeepEqual(newConfig.PartitioningWildcards, instance.Config.PartitioningWildcards) {
-				instance.stopConsuming()
-				instance.doneChan <- fmt.Errorf("elastic consumer group config %s watcher received a bad change in the configuration: max number of members, buffered messages, filter or partitioning wildcards changed", composeCGSName(instance.StreamName, instance.MemberName))
-				return
-			}
-			// new config looks ok to use
-
-			// optimization if nothing changed and already have the consumer for that member
-			if instance.consumer != nil && reflect.DeepEqual(newConfig.Members, instance.Config.Members) && reflect.DeepEqual(newConfig.MemberMappings, instance.Config.MemberMappings) {
-				break
-			}
-
-			instance.Config.Members = newConfig.Members
-			instance.Config.MemberMappings = newConfig.MemberMappings
-			instance.processMembershipChange(ctx)
 
 		case <-ctx.Done():
 			instance.stopConsuming()
@@ -221,8 +216,56 @@ func (instance *ElasticConsumerGroupConsumerInstance) instanceRoutine(ctx contex
 			if instance.consumer == nil && instance.Config.IsInMembership(instance.MemberName) {
 				instance.joinMemberConsumer()
 			}
+		case <-checkpointChan:
+			// If checkpointInterval was set, check for config mismatches at each interval to self-correct.
+			entry, err := instance.kv.Get(ctx, fmt.Sprintf("%s.%s", instance.StreamName, instance.ConsumerGroupName))
+			if err != nil {
+				log.Printf("Warning: Error getting KV value: %v\n", err)
+				break
+			}
+			if entry.Revision() != instance.Config.revision {
+				log.Printf("Warning: Instance config revision %d does not match latest KV entry: %d for consumer %s", instance.Config.revision, entry.Revision(), instance.MemberName)
+				shouldExit, err := instance.processConfigUpdate(ctx, entry)
+				if shouldExit {
+					instance.doneChan <- err
+					return
+				}
+			}
 		}
 	}
+}
+
+func (instance *ElasticConsumerGroupConsumerInstance) processConfigUpdate(ctx context.Context, updateMsg jetstream.KeyValueEntry) (shouldExit bool, exitErr error) {
+	var newConfig ElasticConsumerGroupConfig
+	err := json.Unmarshal(updateMsg.Value(), &newConfig)
+	if err != nil {
+		instance.stopConsuming()
+		return true, fmt.Errorf("elastic consumer group %s config watcher received a bad JSON message: %w", composeKey(instance.StreamName, instance.ConsumerGroupName), err)
+	}
+
+	err = validateConfig(newConfig)
+	if err != nil {
+		instance.stopConsuming()
+		return true, fmt.Errorf("elastic consumer group %s config watcher received an invalid config: %w", composeKey(instance.StreamName, instance.ConsumerGroupName), err)
+	}
+
+	if newConfig.MaxMembers != instance.Config.MaxMembers ||
+		newConfig.Filter != instance.Config.Filter || newConfig.MaxBufferedMsgs != instance.Config.MaxBufferedMsgs || newConfig.MaxBufferedBytes != instance.Config.MaxBufferedBytes ||
+		!reflect.DeepEqual(newConfig.PartitioningWildcards, instance.Config.PartitioningWildcards) {
+		instance.stopConsuming()
+		return true, fmt.Errorf("elastic consumer group config %s watcher received a bad change in the configuration: max number of members, buffered messages, filter or partitioning wildcards changed", composeCGSName(instance.StreamName, instance.MemberName))
+	}
+	// new config looks ok to use
+
+	// optimization if nothing changed and already have the consumer for that member
+	if instance.consumer != nil && reflect.DeepEqual(newConfig.Members, instance.Config.Members) && reflect.DeepEqual(newConfig.MemberMappings, instance.Config.MemberMappings) {
+		return false, nil
+	}
+
+	instance.Config.Members = newConfig.Members
+	instance.Config.MemberMappings = newConfig.MemberMappings
+	instance.processMembershipChange(ctx)
+	return false, nil
 }
 
 // CreateElastic creates an elastic consumer group

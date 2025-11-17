@@ -215,3 +215,120 @@ func TestElastic(t *testing.T) {
 	err = pcgroups.DeleteElastic(ctx, js, streamName, cgName)
 	require_NoError(t, err)
 }
+
+func TestElasticWithCheckpointInterval(t *testing.T) {
+	var streamName = "test"
+	var cgName = "group"
+	var c1, c2 int
+
+	server := RunBasicJetStreamServer()
+	defer shutdownJSServerAndRemoveStorage(t, server)
+
+	nc, err := nats.Connect(server.ClientURL())
+	require_NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	js, err := jetstream.New(nc)
+	require_NoError(t, err)
+
+	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{"bar.*"},
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		_, err = js.Publish(ctx, fmt.Sprintf("bar.%d", i), []byte("payload"))
+		require_NoError(t, err)
+	}
+
+	config := jetstream.ConsumerConfig{
+		MaxAckPending: 1,
+		AckWait:       1 * time.Second,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	}
+
+	_, err = pcgroups.CreateElastic(ctx, js, streamName, cgName, 2, "bar.*", []int{1}, -1, -1)
+	require_NoError(t, err)
+
+	_, err = pcgroups.AddMembers(ctx, js, streamName, cgName, []string{"m1"})
+	require_NoError(t, err)
+
+	// Start first consumer WITHOUT checkpoint interval
+	consumeCtx1, err := pcgroups.ElasticConsume(ctx, js, streamName, cgName, "m1", func(msg jetstream.Msg) {
+		c1++
+		_ = msg.Ack()
+		require_NoError(t, err)
+	}, config)
+	require_NoError(t, err)
+	defer consumeCtx1.Stop()
+
+	// Start second consumer WITH checkpoint interval - this one should detect stale config changes faster
+	consumeCtx2, err := pcgroups.ElasticConsume(ctx, js, streamName, cgName, "m2", func(msg jetstream.Msg) {
+		c2++
+		_ = msg.Ack()
+	}, config, pcgroups.WithCheckpointInterval(500*time.Millisecond))
+	require_NoError(t, err)
+	defer consumeCtx2.Stop()
+
+	now := time.Now()
+	for {
+		if c1 >= 10 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		if time.Since(now) > 5*time.Second {
+			t.Fatalf("timeout waiting for initial messages, got %d", c1)
+		}
+	}
+	require_Equal(t, c1 >= 10, true)
+	require_Equal(t, c2, 0)
+
+	_, err = pcgroups.AddMembers(ctx, js, streamName, cgName, []string{"m2"})
+	require_NoError(t, err)
+
+	// Manually delete both consumers to simulate them being stale
+	// This forces them to need to detect the membership change
+	stream, err := js.Stream(ctx, "test-group")
+	require_NoError(t, err)
+	_ = stream.DeleteConsumer(ctx, "m1")
+	_ = stream.DeleteConsumer(ctx, "m2")
+
+	time.Sleep(200 * time.Millisecond)
+
+	for i := 10; i < 30; i++ {
+		_, err = js.Publish(ctx, fmt.Sprintf("bar.%d", i), []byte("payload"))
+		require_NoError(t, err)
+	}
+
+	// With checkpoint interval, m2 should detect the config change (revision mismatch) within 500ms
+	// Without it, recovery depends on the idle timeout (6 seconds)
+	// Both should eventually recover, but m2 should be faster
+	now = time.Now()
+	for {
+		if c2 > 0 {
+			// m2 detected the change and started consuming
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		if time.Since(now) > 10*time.Second {
+			t.Fatalf("timeout waiting for m2 to detect membership change and start consuming")
+		}
+	}
+
+	// Both should eventually process messages
+	now = time.Now()
+	for {
+		if c1+c2 >= 30 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		if time.Since(now) > 15*time.Second {
+			t.Fatalf("timeout waiting for all messages to be consumed, got c1=%d c2=%d", c1, c2)
+		}
+	}
+
+	err = pcgroups.DeleteElastic(ctx, js, streamName, cgName)
+	require_NoError(t, err)
+}
