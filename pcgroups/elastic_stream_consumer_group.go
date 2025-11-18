@@ -746,10 +746,25 @@ func (instance *ElasticConsumerGroupConsumerInstance) tryCreateConsumer(ctx cont
 func (instance *ElasticConsumerGroupConsumerInstance) startConsuming() {
 	var err error
 
-	instance.consumerConsumeContext, err = instance.consumer.Consume(instance.consumerCallback, jetstream.PullExpiry(pullTimeout), jetstream.PullPriorityGroup(instance.MemberName))
+	opts := []jetstream.PullConsumeOpt{
+		jetstream.PullExpiry(pullTimeout),
+		jetstream.PullPriorityGroup(instance.MemberName),
+		jetstream.ConsumeErrHandler(instance.consumeErrCallback),
+	}
+	instance.consumerConsumeContext, err = instance.consumer.Consume(instance.consumerCallback, opts...)
 	if err != nil {
 		log.Printf("Error starting to consume on my consumer: %v\n", err)
 		return
+	}
+}
+
+func (instance *ElasticConsumerGroupConsumerInstance) consumeErrCallback(_ jetstream.ConsumeContext, err error) {
+	if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerDoesNotExist) || errors.Is(err, jetstream.ErrConsumerNotFound) {
+		// our consumer got deleted, probably because of a membership change, we just stop consuming
+		log.Printf("Consumer not found for member %q: %v\n", instance.MemberName, err)
+		instance.stopConsuming()
+	} else {
+		log.Printf("Error during consume for member %q: %v\n", instance.MemberName, err)
 	}
 }
 
