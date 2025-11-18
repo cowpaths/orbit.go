@@ -703,6 +703,12 @@ func (instance *ElasticConsumerGroupConsumerInstance) joinMemberConsumer() {
 	config.PriorityPolicy = jetstream.PriorityPolicyPinned
 	config.PinnedTTL = config.AckWait
 
+	// Set the config revision in metadata so we can track which config this consumer was created with
+	if config.Metadata == nil {
+		config.Metadata = make(map[string]string)
+	}
+	config.Metadata[ConfigRevisionKey] = fmt.Sprintf("%d", instance.Config.revision)
+
 	// before starting to actually consume messages from the stream consumer, we need to verify that the consumer is created with the correct filters, so Create() must be successful
 	instance.consumer, err = instance.tryCreateConsumer(ctx, config)
 	if err != nil {

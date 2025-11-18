@@ -30,6 +30,8 @@ const (
 	pullTimeout         = 3 * time.Second
 	ackWait             = 2 * pullTimeout
 	consumerIdleTimeout = 2 * pullTimeout
+
+	ConfigRevisionKey = "config_revision"
 )
 
 type MemberMapping struct {
