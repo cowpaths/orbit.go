@@ -59,7 +59,7 @@ type ElasticConsumerGroupConfig struct {
 	MaxBufferedBytes      int64           `json:"max_buffered_bytes,omitempty"` // The max number of bytes buffered in the consumer group's stream
 	Members               []string        `json:"members,omitempty"`            // The list of members in the consumer group
 	MemberMappings        []MemberMapping `json:"member_mappings,omitempty"`    // Or the member mappings, which is a list of member names and the partitions that are assigned to them
-	revision              uint64          // internal revision number of the config
+	revision              uint64          // internal revision number, not serialized
 }
 
 // IsInMembership returns true if the member name is in the current membership of the elastic consumer group
@@ -699,7 +699,7 @@ func (instance *ElasticConsumerGroupConsumerInstance) joinMemberConsumer() {
 	config.Name = instance.MemberName
 	config.FilterSubjects = filters
 
-	config.PriorityGroups = []string{instance.MemberName}
+	config.PriorityGroups = []string{priorityGroupName}
 	config.PriorityPolicy = jetstream.PriorityPolicyPinned
 	config.PinnedTTL = config.AckWait
 
@@ -748,7 +748,7 @@ func (instance *ElasticConsumerGroupConsumerInstance) startConsuming() {
 
 	opts := []jetstream.PullConsumeOpt{
 		jetstream.PullExpiry(pullTimeout),
-		jetstream.PullPriorityGroup(instance.MemberName),
+		jetstream.PullPriorityGroup(priorityGroupName),
 		jetstream.ConsumeErrHandler(instance.consumeErrCallback),
 	}
 	instance.consumerConsumeContext, err = instance.consumer.Consume(instance.consumerCallback, opts...)
@@ -789,7 +789,7 @@ func (instance *ElasticConsumerGroupConsumerInstance) processMembershipChange(ct
 		ci, err := instance.consumer.Info(ctx)
 		if err == nil { // ignoring error as the consumer may not exist yet
 			if slices.ContainsFunc(ci.PriorityGroups, func(pg jetstream.PriorityGroupState) bool {
-				return pg.Group == instance.MemberName && pg.PinnedClientID == instance.currentPinnedID
+				return pg.Group == priorityGroupName && pg.PinnedClientID == instance.currentPinnedID
 			}) {
 				isPinned = true
 			}
@@ -952,12 +952,12 @@ func getElasticConsumerGroupConfig(ctx context.Context, kv jetstream.KeyValue, s
 		return nil, fmt.Errorf("invalid JSON value for the elastic consumer group's config: %w", err)
 	}
 
+	consumerGroupConfig.revision = message.Revision()
 	err = validateConfig(consumerGroupConfig)
 	if err != nil {
 		return nil, fmt.Errorf("invalid elastic consumer group config: %w", err)
 	}
 
-	consumerGroupConfig.revision = message.Revision()
 	return &consumerGroupConfig, nil
 }
 
