@@ -759,8 +759,8 @@ func (instance *ElasticConsumerGroupConsumerInstance) startConsuming() {
 }
 
 func (instance *ElasticConsumerGroupConsumerInstance) consumeErrCallback(_ jetstream.ConsumeContext, err error) {
-	if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerDoesNotExist) || errors.Is(err, jetstream.ErrConsumerNotFound) {
-		// our consumer got deleted, probably because of a membership change, we just stop consuming
+	if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerDoesNotExist) || errors.Is(err, jetstream.ErrConsumerNotFound) || errors.Is(err, jetstream.ErrNoHeartbeat) {
+		// encountered a terminal consumer error, probably because of a membership change, we just stop consuming
 		log.Printf("Consumer not found for member %q: %v\n", instance.MemberName, err)
 		instance.stopConsuming()
 	} else {
